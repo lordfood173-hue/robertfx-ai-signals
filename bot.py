@@ -1,7 +1,9 @@
 import os
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
     Application,
@@ -13,10 +15,6 @@ from telegram.ext import (
     filters,
 )
 
-# =========================
-# SETTINGS
-# =========================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
@@ -25,10 +23,26 @@ PREMIUM_DAYS = int(os.getenv("PREMIUM_DAYS", "30"))
 
 DB_FILE = "signals.db"
 
+# -------------------------
+# Small web server for Render
+# -------------------------
 
-# =========================
-# DATABASE
-# =========================
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "RobertFX AI Signals Bot is running!"
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+
+# -------------------------
+# Database
+# -------------------------
 
 def db():
     return sqlite3.connect(DB_FILE)
@@ -68,9 +82,10 @@ def register_user(user_id, username):
         VALUES (?, ?, NULL, NULL)
     """, (user_id, username))
 
-    cur.execute("""
-        UPDATE users SET username = ? WHERE user_id = ?
-    """, (username, user_id))
+    cur.execute(
+        "UPDATE users SET username = ? WHERE user_id = ?",
+        (username, user_id)
+    )
 
     conn.commit()
     conn.close()
@@ -100,30 +115,44 @@ def set_free_signal_time(user_id):
         UPDATE users
         SET last_free_signal = ?
         WHERE user_id = ?
-    """, (datetime.now(timezone.utc).isoformat(), user_id))
+    """, (
+        datetime.now(timezone.utc).isoformat(),
+        user_id
+    ))
 
     conn.commit()
     conn.close()
+
+
+def is_premium(user_id):
+    user = get_user(user_id)
+
+    if not user or not user[0]:
+        return False
+
+    try:
+        expiry = datetime.fromisoformat(user[0])
+        return expiry > datetime.now(timezone.utc)
+    except Exception:
+        return False
 
 
 def set_premium(user_id):
     conn = db()
     cur = conn.cursor()
 
-    current = cur.execute("""
-        SELECT premium_until FROM users WHERE user_id = ?
+    result = cur.execute("""
+        SELECT premium_until
+        FROM users
+        WHERE user_id = ?
     """, (user_id,)).fetchone()
 
     now = datetime.now(timezone.utc)
 
-    if current and current[0]:
+    if result and result[0]:
         try:
-            old_date = datetime.fromisoformat(current[0])
-
-            if old_date > now:
-                start = old_date
-            else:
-                start = now
+            old_expiry = datetime.fromisoformat(result[0])
+            start = old_expiry if old_expiry > now else now
         except Exception:
             start = now
     else:
@@ -143,25 +172,13 @@ def set_premium(user_id):
     return expiry
 
 
-def is_premium(user_id):
-    user = get_user(user_id)
-
-    if not user or not user[0]:
-        return False
-
-    try:
-        expiry = datetime.fromisoformat(user[0])
-        return expiry > datetime.now(timezone.utc)
-    except Exception:
-        return False
-
-
 def get_signal():
     conn = db()
     cur = conn.cursor()
 
     result = cur.execute("""
-        SELECT value FROM settings
+        SELECT value
+        FROM settings
         WHERE name = 'latest_signal'
     """).fetchone()
 
@@ -171,9 +188,8 @@ def get_signal():
         return result[0]
 
     return (
-        "📊 <b>Today's Signal</b>\n\n"
-        "⚠️ No signal has been published yet.\n\n"
-        "The admin can publish a signal with:\n"
+        "⚠️ <b>No signal published yet.</b>\n\n"
+        "The administrator can publish one using:\n"
         "<code>/setsignal YOUR SIGNAL</code>"
     )
 
@@ -191,9 +207,9 @@ def set_signal(signal):
     conn.close()
 
 
-# =========================
-# START
-# =========================
+# -------------------------
+# Start
+# -------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -205,25 +221,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     keyboard = [
-        [InlineKeyboardButton("🆓 Get Free Signal", callback_data="free_signal")],
-        [InlineKeyboardButton("💎 Premium Signals", callback_data="premium")],
-        [InlineKeyboardButton("📊 Latest Signal", callback_data="latest")],
+        [
+            InlineKeyboardButton(
+                "🆓 Get Free Signal",
+                callback_data="free_signal"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💎 Premium Signals",
+                callback_data="premium"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 Latest Signal",
+                callback_data="latest"
+            )
+        ]
     ]
 
     await update.message.reply_text(
-        f"👋 <b>Welcome to RobertFX AI Signals</b>\n\n"
-        f"Forex & BTC market signals delivered directly to Telegram.\n\n"
-        f"🆓 Free users receive 1 signal per day.\n"
-        f"💎 Premium members receive additional signals.\n\n"
-        f"⚠️ Trading involves risk. Signals are not guaranteed profits.",
+        "👋 <b>Welcome to RobertFX AI Signals</b>\n\n"
+        "Forex & BTC trading signals delivered directly to Telegram.\n\n"
+        "🆓 Free users receive 1 signal per day.\n"
+        "💎 Premium members receive additional signals.\n\n"
+        "⚠️ Trading involves risk. Signals are not guaranteed profits.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-# =========================
-# BUTTONS
-# =========================
+# -------------------------
+# Buttons
+# -------------------------
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -234,27 +265,30 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "free_signal":
 
-        user = get_user(user_id)
-
         if is_premium(user_id):
             await query.message.reply_text(
-                "💎 You are already a Premium member.\n\n"
+                "💎 You are a Premium member.\n\n"
                 "You have access to Premium signals."
             )
             return
 
+        user = get_user(user_id)
+
         last_signal = user[1] if user else None
 
         if last_signal:
-
             try:
                 last_time = datetime.fromisoformat(last_signal)
-                difference = datetime.now(timezone.utc) - last_time
+                elapsed = datetime.now(timezone.utc) - last_time
 
-                if difference < timedelta(hours=24):
-                    remaining = timedelta(hours=24) - difference
+                if elapsed < timedelta(hours=24):
 
-                    hours = int(remaining.total_seconds() // 3600)
+                    remaining = timedelta(hours=24) - elapsed
+
+                    hours = int(
+                        remaining.total_seconds() // 3600
+                    )
+
                     minutes = int(
                         (remaining.total_seconds() % 3600) // 60
                     )
@@ -263,9 +297,9 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"⏳ You've already received today's free signal.\n\n"
                         f"Next free signal in approximately "
                         f"{hours}h {minutes}m.\n\n"
-                        f"💎 Want more signals?\n"
-                        f"Use /premium"
+                        f"💎 Use /premium for more signals."
                     )
+
                     return
 
             except Exception:
@@ -291,12 +325,11 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_premium(user_id):
 
             user = get_user(user_id)
-
             expiry = datetime.fromisoformat(user[0])
 
             await query.message.reply_text(
-                f"💎 <b>Premium Active</b>\n\n"
-                f"Your Premium access expires:\n"
+                "💎 <b>Premium Active</b>\n\n"
+                f"Expires:\n"
                 f"{expiry.strftime('%Y-%m-%d %H:%M UTC')}",
                 parse_mode="HTML"
             )
@@ -313,11 +346,11 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
 
             await query.message.reply_text(
-                f"💎 <b>Premium Signals</b>\n\n"
-                f"Get access to additional Forex & BTC signals.\n\n"
+                "💎 <b>Premium Signals</b>\n\n"
+                "Get additional Forex & BTC signals.\n\n"
                 f"📅 Duration: {PREMIUM_DAYS} days\n"
                 f"💰 Price: {PREMIUM_PRICE} Telegram Stars\n\n"
-                f"Tap below to subscribe.",
+                "Tap below to subscribe.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
@@ -344,39 +377,45 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# =========================
-# PAYMENT
-# =========================
+# -------------------------
+# Payment
+# -------------------------
 
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def precheckout(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    query = update.pre_checkout_query
-
-    await query.answer(ok=True)
+    await update.pre_checkout_query.answer(ok=True)
 
 
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def successful_payment(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    payment = update.message.successful_payment
     user_id = update.effective_user.id
 
     expiry = set_premium(user_id)
 
     await update.message.reply_text(
-        f"✅ <b>Payment successful!</b>\n\n"
-        f"💎 Premium activated.\n\n"
-        f"Your Premium access expires:\n"
+        "✅ <b>Payment successful!</b>\n\n"
+        "💎 Premium activated.\n\n"
+        f"Premium expires:\n"
         f"{expiry.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        f"🚀 You now have access to Premium signals.",
+        "🚀 You now have access to Premium signals.",
         parse_mode="HTML"
     )
 
 
-# =========================
-# PREMIUM COMMAND
-# =========================
+# -------------------------
+# Premium command
+# -------------------------
 
-async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def premium(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user_id = update.effective_user.id
 
@@ -386,9 +425,10 @@ async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expiry = datetime.fromisoformat(user[0])
 
         await update.message.reply_text(
-            f"💎 Premium is active.\n\n"
+            "💎 Premium is active.\n\n"
             f"Expires: {expiry.strftime('%Y-%m-%d %H:%M UTC')}"
         )
+
         return
 
     keyboard = [
@@ -401,20 +441,23 @@ async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     await update.message.reply_text(
-        f"💎 <b>RobertFX Premium</b>\n\n"
+        "💎 <b>RobertFX Premium</b>\n\n"
         f"📅 {PREMIUM_DAYS} days\n"
         f"💰 {PREMIUM_PRICE} Telegram Stars\n\n"
-        f"Premium members receive additional signals.",
+        "Premium members receive additional signals.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-# =========================
-# ADMIN COMMAND
-# =========================
+# -------------------------
+# Admin
+# -------------------------
 
-async def set_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_signal_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if update.effective_user.id != ADMIN_ID:
         return
@@ -428,6 +471,7 @@ async def set_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "SL: 118500\n"
             "TP: 123000"
         )
+
         return
 
     signal = " ".join(context.args)
@@ -439,64 +483,24 @@ async def set_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-# =========================
-# ADMIN BROADCAST
-# =========================
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage:\n/broadcast Your message"
-        )
-        return
-
-    message = " ".join(context.args)
-
-    conn = db()
-    cur = conn.cursor()
-
-    users = cur.execute(
-        "SELECT user_id FROM users"
-    ).fetchall()
-
-    conn.close()
-
-    sent = 0
-
-    for user in users:
-
-        try:
-
-            await context.bot.send_message(
-                chat_id=user[0],
-                text=message,
-                parse_mode="HTML"
-            )
-
-            sent += 1
-
-        except Exception:
-            pass
-
-    await update.message.reply_text(
-        f"✅ Broadcast sent to {sent} users."
-    )
-
-
-# =========================
-# MAIN
-# =========================
+# -------------------------
+# Main
+# -------------------------
 
 def main():
 
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN environment variable is missing.")
+        raise ValueError(
+            "BOT_TOKEN environment variable is missing."
+        )
 
     setup_database()
+
+    # Start Render web server
+    threading.Thread(
+        target=run_web_server,
+        daemon=True
+    ).start()
 
     application = (
         Application.builder()
@@ -514,10 +518,6 @@ def main():
 
     application.add_handler(
         CommandHandler("setsignal", set_signal_command)
-    )
-
-    application.add_handler(
-        CommandHandler("broadcast", broadcast)
     )
 
     application.add_handler(
